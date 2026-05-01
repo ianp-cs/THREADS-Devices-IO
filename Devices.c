@@ -65,9 +65,9 @@ static int disk_mutex[THREADS_MAX_DISKS]; // Mutex for disk requests queues
 /* FUNCTIONS */
 static int ClockDriver(char*);
 static int DiskDriver(char*);
-int sys_disk_info(char* deviceName, int* sectorSize, int* sectorCount, int* trackCount, int* platterCount);
-int sys_disk_read(char* deviceName, void* dataBuffer, int* platter, int* track, int* firstSector, int* sectors, int* status);
-int sys_disk_write(char* deviceName, void* dataBuffer, int* platter, int* track, int* firstSector, int* sectors, int* status);
+int sys_disk_info(DiskRequest* req);
+int sys_disk_read(DiskRequest* req, int* currentTrack, int* currentSector);
+int sys_disk_write(DiskRequest* req, int* currentTrack, int* currentSector);
 int sys_sleep(int* seconds);
 static void sysCall4(system_call_arguments_t* args);
 static void pushSleepQueue(DevicesProcess* target);
@@ -76,6 +76,8 @@ static void pushDiskReq(int index, DiskRequest* head, DiskRequest* target);
 static void pushDiskReqHelperFCFS(int index, DiskRequest* head, DiskRequest* target);
 static DiskRequest* popDiskReq(int index, DiskRequest* head);
 static DiskRequest* popDiskReqHelperFCFS(int index, DiskRequest* head);
+static void initDiskInfo(int diskNum);
+static int moveDiskArm(char* deviceName, int target);
 static inline void checkKernelMode(const char* functionName);
 
 extern int DevicesEntryPoint(char*);
@@ -197,30 +199,15 @@ static int DiskDriver(char* arg)
 {
     int pid = k_getpid();
     int diskNum = atoi(arg);
-    int currentTrack = 0;
-    device_control_block_t devRequest;
 
     set_psr(get_psr() | PSR_INTERRUPTS);
 
     /* Read the disk info */
-    int result;
-    int status;
+    initDiskInfo(diskNum);
 
-    sprintf(diskInfo[diskNum].deviceName, "disk%d", diskNum);
-
-    devRequest.command = DISK_INFO;
-    result = device_control(diskInfo[diskNum].deviceName, devRequest);
-
-    if (result != 0)
-    {
-        console_output(false, "DiskDriver(): Device control failed! Closing program...\n");
-        stop(1);
-    }
-
-    wait_device(diskInfo[diskNum].deviceName, &status);
-    diskInfo[diskNum].tracks = status & 0xffff;
-    diskInfo[diskNum].platters = status >> 16;
-
+    /* Initialize disk arm position */
+    int currentTrack = moveDiskArm(diskInfo[diskNum].deviceName, 0);
+    int currentSector = 0;
 
     /* Operating loop */
     
@@ -230,25 +217,20 @@ static int DiskDriver(char* arg)
 
         if (DISK_ARM_ALG == DISK_ARM_ALG_FCFS)
         {
-            DiskRequest* req = diskRequestHead[diskNum];
+            DiskRequest* req = popDiskReq(diskNum, diskRequestHead[diskNum]);
 
             switch (req->type)
             {
+                case INFO:
+                    req->result = sys_disk_info(req);
+                    break;
+
                 case READ:
-                    req->result = sys_disk_read(req->deviceName, req->dataBuffer, &req->platter, 
-                                                &req->track, &req->firstSector, &req->sectors, 
-                                                &req->status);
+                    req->result = sys_disk_read(req, &currentTrack, &currentSector);
                     break;
 
                 case WRITE:
-                    req->result = sys_disk_write(req->deviceName, req->dataBuffer, &req->platter,
-                                                &req->track, &req->firstSector, &req->sectors,
-                                                &req->status);
-                    break;
-
-                case INFO:
-                    req->result = sys_disk_info(req->deviceName, &req->sectorSize, &req->sectorCount, 
-                                                &req->trackCount, &req->platterCount);
+                    req->result = sys_disk_write(req, &currentTrack, &currentSector);
                     break;
             }
 
@@ -260,28 +242,115 @@ static int DiskDriver(char* arg)
 }
 
 
-int sys_disk_read(char* deviceName, void* dataBuffer, int* platter, int* track, int* firstSector, int* sectors, int* status)
+static void initDiskInfo(int diskNum)
 {
+    device_control_block_t devRequest;
+    int result;
+    int status;
 
-    return 0;
+    sprintf(diskInfo[diskNum].deviceName, "disk%d", diskNum);
+
+    devRequest.command = DISK_INFO;
+    result = device_control(diskInfo[diskNum].deviceName, devRequest);
+
+    if (result != 0)
+    {
+        console_output(false, "initDiskInfo(): Device control failed! Closing program...\n");
+        stop(1);
+    }
+
+    wait_device(diskInfo[diskNum].deviceName, &status);
+    diskInfo[diskNum].tracks = status & 0xffff;
+    diskInfo[diskNum].platters = status >> 16;
 }
 
 
-int sys_disk_write(char* deviceName, void* dataBuffer, int* platter, int* track, int* firstSector, int* sectors, int* status)
+static int moveDiskArm(char* deviceName, int target)
 {
+    device_control_block_t devRequest;
+    int result = -1;
+    int status = -1;
 
-    return 0;
+    devRequest.command = DISK_SEEK;
+    devRequest.control1 = target;
+    devRequest.control2 = 0;
+
+    result = device_control(deviceName, devRequest);
+
+    if (result != 0)
+    {
+        console_output(false, "moveDiskArm(): Device control failed! Couldn't move arm...\n");
+        stop(1);
+    }
+
+    wait_device(deviceName, &status);
+
+    return target;
 }
 
 
-int sys_disk_info(char* deviceName, int* sectorSize, int* sectorCount, int* trackCount, int* platterCount)
+int sys_disk_info(DiskRequest* req)
 {
     int index = k_getpid() - 6; // - 6 because disk pids start at 6
 
-    *sectorSize = THREADS_DISK_SECTOR_SIZE;
-    *sectorCount = THREADS_DISK_SECTOR_COUNT;
-    *trackCount = diskInfo[index].tracks;
-    *platterCount = diskInfo[index].platters;
+    req->sectorSize = THREADS_DISK_SECTOR_SIZE;
+    req->sectorCount = THREADS_DISK_SECTOR_COUNT;
+    req->trackCount = diskInfo[index].tracks;
+    req->platterCount = diskInfo[index].platters;
+
+    return 0;
+}
+
+
+int sys_disk_read(DiskRequest* req, int* currentTrack, int* currentSector)
+{
+    device_control_block_t devRequest;
+    int result = -1;
+    int status = -1;
+    int sectorsProcessed = 0;
+
+   *currentSector = req->firstSector;
+
+    if (*currentTrack != req->track)
+    {
+        *currentTrack = moveDiskArm(req->deviceName, req->track);
+    }
+    
+    devRequest.command = DISK_READ;
+    devRequest.control1 = req->platter;
+    devRequest.control2 = currentSector;
+    devRequest.input_data = req->dataBuffer;
+
+    result = device_control(req->deviceName, devRequest);
+
+    wait_device(req->deviceName, &status);
+
+    return 0;
+}
+
+
+int sys_disk_write(DiskRequest* req, int* currentTrack, int* currentSector)
+{
+    device_control_block_t devRequest;
+    int result = -1;
+    int status = -1;
+
+    *currentSector = req->firstSector;
+    
+    if (*currentTrack != req->track)
+    {
+        *currentTrack = moveDiskArm(req->deviceName, req->track);
+    }
+
+    devRequest.command = DISK_WRITE;
+    devRequest.control1 = req->platter;
+    devRequest.control2 = currentSector;
+    
+    devRequest.output_data = req->dataBuffer;
+
+    result = device_control(req->deviceName, devRequest);
+
+    wait_device(req->deviceName, &status);
 
     return 0;
 }
@@ -348,6 +417,7 @@ static void sysCall4(system_call_arguments_t* args)
 
                     args->arguments[3] = (intptr_t)req.result;
                     args->arguments[0] = (intptr_t)req.status;
+                    args->arguments[1] = (intptr_t)req.dataBuffer;
 
                     return;
                 }
