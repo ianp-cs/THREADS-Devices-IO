@@ -66,8 +66,8 @@ static int disk_mutex[THREADS_MAX_DISKS]; // Mutex for disk requests queues
 static int ClockDriver(char*);
 static int DiskDriver(char*);
 int sys_disk_info(DiskRequest* req);
-int sys_disk_read(DiskRequest* req, int* currentTrack, int* currentSector);
-int sys_disk_write(DiskRequest* req, int* currentTrack, int* currentSector);
+int sys_disk_read(DiskRequest* req, int diskNum, int* currentTrack, int* currentSector);
+int sys_disk_write(DiskRequest* req, int diskNum, int* currentTrack, int* currentSector);
 int sys_sleep(int* seconds);
 static void sysCall4(system_call_arguments_t* args);
 static void pushSleepQueue(DevicesProcess* target);
@@ -226,11 +226,11 @@ static int DiskDriver(char* arg)
                     break;
 
                 case READ:
-                    req->result = sys_disk_read(req, &currentTrack, &currentSector);
+                    req->result = sys_disk_read(req, diskNum, &currentTrack, &currentSector);
                     break;
 
                 case WRITE:
-                    req->result = sys_disk_write(req, &currentTrack, &currentSector);
+                    req->result = sys_disk_write(req, diskNum, &currentTrack, &currentSector);
                     break;
             }
 
@@ -302,34 +302,48 @@ int sys_disk_info(DiskRequest* req)
 }
 
 
-int sys_disk_read(DiskRequest* req, int* currentTrack, int* currentSector)
+int sys_disk_read(DiskRequest* req, int diskNum, int* currentTrack, int* currentSector)
 {
     device_control_block_t devRequest;
     int sectorsProcessed = 0;
 
-   *currentSector = req->firstSector;
+    *currentSector = req->firstSector;
 
     if (*currentTrack != req->track)
     {
         *currentTrack = moveDiskArm(req->deviceName, req->track);
     }
-    
-    devRequest.command = DISK_READ;
-    devRequest.control1 = (uint8_t)req->platter;
-    devRequest.control2 = (uint8_t)*currentSector;
-    devRequest.input_data = req->dataBuffer;
 
-    req->result = device_control(req->deviceName, devRequest);
+    for (int i = 0; i < req->sectors; i++)
+    {
+        devRequest.command = DISK_READ;
+        devRequest.control1 = (uint8_t)req->platter;
+        devRequest.control2 = (uint8_t)*currentSector;
+        devRequest.input_data = (unsigned char*)req->dataBuffer + sectorsProcessed * THREADS_DISK_SECTOR_SIZE;
 
-    wait_device(req->deviceName, &req->status);
+        req->result = device_control(req->deviceName, devRequest);
 
-    return 0;
+        wait_device(req->deviceName, &req->status);
+
+        // Move to next sector
+        (*currentSector)++;
+        sectorsProcessed++;
+
+        // Move disk arm to new track if reached the end of sectors for current track
+        if (*currentSector == THREADS_DISK_SECTOR_COUNT)
+        {
+            *currentSector = 0;
+            int nextTrack = (*currentTrack + 1) % diskInfo[diskNum].tracks;
+            *currentTrack = moveDiskArm(req->deviceName, nextTrack);
+        }
+    }
 }
 
 
-int sys_disk_write(DiskRequest* req, int* currentTrack, int* currentSector)
+int sys_disk_write(DiskRequest* req, int diskNum, int* currentTrack, int* currentSector)
 {
     device_control_block_t devRequest;
+    int sectorsProcessed = 0;
 
     *currentSector = req->firstSector;
     
@@ -338,14 +352,29 @@ int sys_disk_write(DiskRequest* req, int* currentTrack, int* currentSector)
         *currentTrack = moveDiskArm(req->deviceName, req->track);
     }
 
-    devRequest.command = DISK_WRITE;
-    devRequest.control1 = (uint8_t)req->platter;
-    devRequest.control2 = (uint8_t)*currentSector;
-    devRequest.output_data = req->dataBuffer;
+    for (int i = 0; i < req->sectors; i++)
+    {
+        devRequest.command = DISK_WRITE;
+        devRequest.control1 = (uint8_t)req->platter;
+        devRequest.control2 = (uint8_t)*currentSector;
+        devRequest.output_data = (unsigned char*)req->dataBuffer + sectorsProcessed * THREADS_DISK_SECTOR_SIZE;
 
-    req->result = device_control(req->deviceName, devRequest);
+        req->result = device_control(req->deviceName, devRequest);
 
-    wait_device(req->deviceName, &req->status);
+        wait_device(req->deviceName, &req->status);
+
+        // Move to next sector
+        (*currentSector)++;
+        sectorsProcessed++;
+
+        // Move disk arm to new track if reached the end of sectors for current track
+        if (*currentSector == THREADS_DISK_SECTOR_COUNT)
+        {
+            *currentSector = 0;
+            int nextTrack = (*currentTrack + 1) % diskInfo[diskNum].tracks;
+            *currentTrack = moveDiskArm(req->deviceName, nextTrack);
+        }
+    }
 
     return 0;
 }
