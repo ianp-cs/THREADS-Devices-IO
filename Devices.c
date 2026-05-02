@@ -305,8 +305,6 @@ int sys_disk_info(DiskRequest* req)
 int sys_disk_read(DiskRequest* req, int* currentTrack, int* currentSector)
 {
     device_control_block_t devRequest;
-    int result = -1;
-    int status = -1;
     int sectorsProcessed = 0;
 
    *currentSector = req->firstSector;
@@ -317,13 +315,13 @@ int sys_disk_read(DiskRequest* req, int* currentTrack, int* currentSector)
     }
     
     devRequest.command = DISK_READ;
-    devRequest.control1 = req->platter;
-    devRequest.control2 = currentSector;
+    devRequest.control1 = (uint8_t)req->platter;
+    devRequest.control2 = (uint8_t)*currentSector;
     devRequest.input_data = req->dataBuffer;
 
-    result = device_control(req->deviceName, devRequest);
+    req->result = device_control(req->deviceName, devRequest);
 
-    wait_device(req->deviceName, &status);
+    wait_device(req->deviceName, &req->status);
 
     return 0;
 }
@@ -332,8 +330,6 @@ int sys_disk_read(DiskRequest* req, int* currentTrack, int* currentSector)
 int sys_disk_write(DiskRequest* req, int* currentTrack, int* currentSector)
 {
     device_control_block_t devRequest;
-    int result = -1;
-    int status = -1;
 
     *currentSector = req->firstSector;
     
@@ -343,14 +339,13 @@ int sys_disk_write(DiskRequest* req, int* currentTrack, int* currentSector)
     }
 
     devRequest.command = DISK_WRITE;
-    devRequest.control1 = req->platter;
-    devRequest.control2 = currentSector;
-    
+    devRequest.control1 = (uint8_t)req->platter;
+    devRequest.control2 = (uint8_t)*currentSector;
     devRequest.output_data = req->dataBuffer;
 
-    result = device_control(req->deviceName, devRequest);
+    req->result = device_control(req->deviceName, devRequest);
 
-    wait_device(req->deviceName, &status);
+    wait_device(req->deviceName, &req->status);
 
     return 0;
 }
