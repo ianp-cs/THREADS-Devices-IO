@@ -69,6 +69,9 @@ int sys_disk_info(DiskRequest* req);
 int sys_disk_read(DiskRequest* req, int diskNum, int* currentTrack, int* currentSector);
 int sys_disk_write(DiskRequest* req, int diskNum, int* currentTrack, int* currentSector);
 int sys_sleep(int* seconds);
+int sys_call_info(system_call_arguments_t* args, DiskRequest* req);
+int sys_call_read(system_call_arguments_t* args, DiskRequest* req);
+int sys_call_write(system_call_arguments_t* args, DiskRequest* req);
 static void sysCall4(system_call_arguments_t* args);
 static void pushSleepQueue(DevicesProcess* target);
 static DevicesProcess* popSleepQueue();
@@ -402,14 +405,120 @@ int sys_sleep(int* seconds)
 }
 
 
+int sys_call_info(system_call_arguments_t* args, DiskRequest* req)
+{
+    req->deviceName = (char*)args->arguments[0];
+    req->type = INFO;
+
+    for (int i = 0; i < THREADS_MAX_DISKS; i++)
+    {
+        if (strcmp(req->deviceName, diskInfo[i].deviceName) == 0)
+        {
+            pushDiskReq(i, diskRequestHead[i], req);
+            k_semv(devicesProcs[(i + 6) % MAXPROC].semID); // i + 6 because disk pids start at 6
+            k_semp(devicesProcs[req->pid % MAXPROC].semID); // Sleep until disk is finished
+
+            args->arguments[3] = (intptr_t)req->result;
+            args->arguments[0] = (intptr_t)req->sectorSize;
+            args->arguments[1] = (intptr_t)req->sectorCount;
+            args->arguments[2] = (intptr_t)req->trackCount;
+            args->arguments[4] = (intptr_t)req->platterCount;
+
+            return;
+        }
+    }
+
+    console_output(false, "SYS_DISKINFO(): Invalid device name.\n");
+    return -1;
+}
+
+
+int sys_call_read(system_call_arguments_t* args, DiskRequest* req)
+{
+    req->deviceName = (char*)args->arguments[0];
+
+    req->type = READ;
+    req->dataBuffer = args->arguments[1];
+    req->platter = args->arguments[2];
+    req->track = args->arguments[3];
+    req->firstSector = args->arguments[4];
+    req->sectors = args->arguments[5];
+
+    for (int i = 0; i < THREADS_MAX_DISKS; i++)
+    {
+        if (strcmp(req->deviceName, diskInfo[i].deviceName) == 0)
+        {
+            pushDiskReq(i, diskRequestHead[i], req);
+            k_semv(devicesProcs[(i + 6) % MAXPROC].semID); // i + 6 because disk pids start at 6
+            k_semp(devicesProcs[req->pid % MAXPROC].semID); // Sleep until disk is finished
+
+            args->arguments[3] = (intptr_t)req->result;
+            args->arguments[0] = (intptr_t)req->status;
+            args->arguments[1] = (intptr_t)req->dataBuffer;
+
+            return;
+        }
+    }
+
+    console_output(false, "SYS_DISKREAD(): Invalid device name.\n");
+    return -1;
+}
+
+
+int sys_call_write(system_call_arguments_t* args, DiskRequest* req)
+{
+    req->deviceName = (char*)args->arguments[0];
+
+    req->type = WRITE;
+    req->dataBuffer = args->arguments[1];
+    req->platter = args->arguments[2];
+    req->track = args->arguments[3];
+    req->firstSector = args->arguments[4];
+    req->sectors = args->arguments[5];
+
+    for (int i = 0; i < THREADS_MAX_DISKS; i++)
+    {
+        if (strcmp(req->deviceName, diskInfo[i].deviceName) == 0)
+        {
+            pushDiskReq(i, diskRequestHead[i], req);
+            k_semv(devicesProcs[(i + 6) % MAXPROC].semID); // i + 6 because disk pids start at 6
+            k_semp(devicesProcs[req->pid % MAXPROC].semID); // Sleep until disk is finished
+
+            args->arguments[3] = (intptr_t)req->result;
+            args->arguments[0] = (intptr_t)req->status;
+
+            return;
+        }
+    }
+
+    console_output(false, "SYS_DISKWRITE(): Invalid device name.\n");
+    return -1;
+}
+
+
 static void sysCall4(system_call_arguments_t* args)
 {
+    // Initialize Disk request
     DiskRequest req;
     req.nextReq = NULL;
     req.prevReq = NULL;
+    req.pid = -1;
+    req.deviceName = NULL;
+    req.sectorSize = -1;
+    req.sectorCount = -1;
+    req.trackCount = -1;
+    req.platterCount = -1;
+    req.dataBuffer = NULL;
+    req.platter = -1;
+    req.track = -1;
+    req.firstSector = -1;
+    req.sectors = -1;
+    req.result = -1;
+    req.status = -1;
 
     // Add to device process list
     int pid = k_getpid();
+    req.pid = pid;
 
     devicesProcs[pid % MAXPROC].pid = pid;
     devicesProcs[pid % MAXPROC].semID = k_semcreate(0);
@@ -427,90 +536,13 @@ static void sysCall4(system_call_arguments_t* args)
             break;
 
         case SYS_DISKREAD:
-            req.deviceName = (char*)args->arguments[0];
-
-            req.pid = pid;
-            req.type = READ;
-            req.dataBuffer = args->arguments[1];
-            req.platter = args->arguments[2];
-            req.track = args->arguments[3];
-            req.firstSector = args->arguments[4];
-            req.sectors = args->arguments[5];
-
-            for (int i = 0; i < THREADS_MAX_DISKS; i++)
-            {
-                if (strcmp(req.deviceName, diskInfo[i].deviceName) == 0)
-                {
-                    pushDiskReq(i, diskRequestHead[i], &req);
-                    k_semv(devicesProcs[(i + 6) % MAXPROC].semID); // i + 6 because disk pids start at 6
-                    k_semp(devicesProcs[pid % MAXPROC].semID); // Sleep until disk is finished
-
-                    args->arguments[3] = (intptr_t)req.result;
-                    args->arguments[0] = (intptr_t)req.status;
-                    args->arguments[1] = (intptr_t)req.dataBuffer;
-
-                    return;
-                }
-            }
-
-            console_output(false, "SYS_DISKREAD(): Invalid device name.\n");
-            return -1;
+            return sys_call_read(args, &req);
 
         case SYS_DISKWRITE:
-            req.deviceName = (char*)args->arguments[0];
-
-            req.pid = pid;
-            req.type = WRITE;
-            req.dataBuffer = args->arguments[1];
-            req.platter = args->arguments[2];
-            req.track = args->arguments[3];
-            req.firstSector = args->arguments[4];
-            req.sectors = args->arguments[5];
-
-            for (int i = 0; i < THREADS_MAX_DISKS; i++)
-            {
-                if (strcmp(req.deviceName, diskInfo[i].deviceName) == 0)
-                {
-                    pushDiskReq(i, diskRequestHead[i], &req);
-                    k_semv(devicesProcs[(i + 6) % MAXPROC].semID); // i + 6 because disk pids start at 6
-                    k_semp(devicesProcs[pid % MAXPROC].semID); // Sleep until disk is finished
-
-                    args->arguments[3] = (intptr_t)req.result;
-                    args->arguments[0] = (intptr_t)req.status;
-
-                    return;
-                }
-            }
-
-            console_output(false, "SYS_DISKWRITE(): Invalid device name.\n");
-            return -1;
+            return sys_call_write(args, &req);
 
         case SYS_DISKINFO:
-            req.deviceName = (char*)args->arguments[0];
-
-            req.pid = pid;
-            req.type = INFO;
-
-            for (int i = 0; i < THREADS_MAX_DISKS; i++)
-            {
-                if (strcmp(req.deviceName, diskInfo[i].deviceName) == 0)
-                {
-                    pushDiskReq(i, diskRequestHead[i], &req);
-                    k_semv(devicesProcs[(i + 6) % MAXPROC].semID); // i + 6 because disk pids start at 6
-                    k_semp(devicesProcs[pid % MAXPROC].semID); // Sleep until disk is finished
-
-                    args->arguments[3] = (intptr_t)req.result;
-                    args->arguments[0] = (intptr_t)req.sectorSize;
-                    args->arguments[1] = (intptr_t)req.sectorCount;
-                    args->arguments[2] = (intptr_t)req.trackCount;
-                    args->arguments[4] = (intptr_t)req.platterCount;
-
-                    return;
-                }
-            }
-
-            console_output(false, "SYS_DISKINFO(): Invalid device name.\n");
-            return -1;
+            return sys_call_info(args, &req);
     }
 }
 
