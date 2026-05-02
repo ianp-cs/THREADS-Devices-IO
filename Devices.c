@@ -234,7 +234,7 @@ static int DiskDriver(char* arg)
                     break;
             }
 
-            k_semv(devicesProcs[req->pid % MAXPROC].semID);
+            k_semv(devicesProcs[req->pid % MAXPROC].semID); // Unblock user process that used disk
         }
     }
     
@@ -307,6 +307,7 @@ int sys_disk_read(DiskRequest* req, int diskNum, int* currentTrack, int* current
     device_control_block_t devRequest;
     int sectorsProcessed = 0;
 
+    // Move to initial track and sector
     *currentSector = req->firstSector;
 
     if (*currentTrack != req->track)
@@ -316,6 +317,7 @@ int sys_disk_read(DiskRequest* req, int diskNum, int* currentTrack, int* current
 
     for (int i = 0; i < req->sectors; i++)
     {
+        // Operate on sector
         devRequest.command = DISK_READ;
         devRequest.control1 = (uint8_t)req->platter;
         devRequest.control2 = (uint8_t)*currentSector;
@@ -345,6 +347,7 @@ int sys_disk_write(DiskRequest* req, int diskNum, int* currentTrack, int* curren
     device_control_block_t devRequest;
     int sectorsProcessed = 0;
 
+    // Move to initial track and sector
     *currentSector = req->firstSector;
     
     if (*currentTrack != req->track)
@@ -354,6 +357,7 @@ int sys_disk_write(DiskRequest* req, int diskNum, int* currentTrack, int* curren
 
     for (int i = 0; i < req->sectors; i++)
     {
+        // Operate on sector
         devRequest.command = DISK_WRITE;
         devRequest.control1 = (uint8_t)req->platter;
         devRequest.control2 = (uint8_t)*currentSector;
@@ -401,6 +405,8 @@ int sys_sleep(int* seconds)
 static void sysCall4(system_call_arguments_t* args)
 {
     DiskRequest req;
+    req.nextReq = NULL;
+    req.prevReq = NULL;
 
     // Add to device process list
     int pid = k_getpid();
