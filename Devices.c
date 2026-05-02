@@ -26,7 +26,6 @@ typedef struct devices_proc
     int pid;
     int semID;
     int wakeupTime;
-    bool kill;
 } DevicesProcess;
 
 typedef struct
@@ -81,15 +80,17 @@ static DiskRequest* popDiskReq(int index, DiskRequest* head);
 static DiskRequest* popDiskReqHelperFCFS(int index, DiskRequest* head);
 static void initDiskInfo(int diskNum);
 static int moveDiskArm(char* deviceName, int target);
+static void clearProcess(DevicesProcess* target);
 static inline void checkKernelMode(const char* functionName);
 
 extern int DevicesEntryPoint(char*);
 
-/* CONSTANTS */
+/* GLOBAL VARIABLES */
 static DevicesProcess devicesProcs[MAXPROC];
 static DevicesProcess* sleepQueueHead;
 static DiskRequest* diskRequestHead[THREADS_MAX_DISKS];
 static DiskInformation diskInfo[THREADS_MAX_DISKS];
+static int diskInitChecker = -1;
 
 
 int SystemCallsEntryPoint(char* arg)
@@ -113,12 +114,8 @@ int SystemCallsEntryPoint(char* arg)
     /* Initialize the process table */
     for (int i = 0; i < MAXPROC; ++i)
     {
-        devicesProcs[i].pid = -1;
-        devicesProcs[i].semID = -1;
-        devicesProcs[i].wakeupTime = -1;
-        devicesProcs[i].kill = false;
-        devicesProcs[i].pNextSleeper = NULL;
-        devicesProcs[i].pPrevSleeper = NULL;
+        clearProcess(&devicesProcs[i]);
+        devicesProcs[i].semID = k_semcreate(0);
     }
     
     // Create Mutex Lock
@@ -147,24 +144,34 @@ int SystemCallsEntryPoint(char* arg)
         }
         
         devicesProcs[diskPids[i] % MAXPROC].pid = diskPids[i];
-        devicesProcs[diskPids[i] % MAXPROC].semID = k_semcreate(0);
         disk_mutex[i] = k_semcreate(1);
     }
+
+    // Make program wait until all disks spin up
+    diskInitChecker = k_semcreate(0);
+
+    for (int i = 0; i < THREADS_MAX_DISKS; i++)
+    {
+        k_semp(diskInitChecker); // Handshake with each disk
+    }
+
+    k_semfree(diskInitChecker);
 
     /* Create first user-level process and wait for it to finish */
     sys_spawn("DevicesEntryPoint", DevicesEntryPoint, NULL, 8 * THREADS_MIN_STACK_SIZE, 3);
 
     // End running processes
-    returnPid = k_wait(&status); // Disk driver 0,      pid 6
-    k_semfree(devicesProcs[diskPids[0]].semID);
-    returnPid = k_wait(&status); // Disk driver 1,      pid 7
-    k_semfree(devicesProcs[diskPids[1]].semID);
-
     returnPid = k_wait(&status); // DevicesEntryPoint,  pid 8
+    returnPid = k_wait(&status); // Disk driver 0,      pid 6
+    returnPid = k_wait(&status); // Disk driver 1,      pid 7
 
     k_kill(clockPID, SIG_TERM);
     returnPid = k_wait(&status); // Clock driver,       pid 5
-    k_semfree(devicesProcs[clockPID % MAXPROC].semID);
+
+    for (int i = 0; i < MAXPROC; ++i)
+    {
+        k_semfree(devicesProcs[i].semID);
+    }
 
     return 0;
 }
@@ -265,6 +272,7 @@ static void initDiskInfo(int diskNum)
     wait_device(diskInfo[diskNum].deviceName, &status);
     diskInfo[diskNum].tracks = status & 0xffff;
     diskInfo[diskNum].platters = status >> 16;
+    k_semv(diskInitChecker);
 }
 
 
@@ -424,7 +432,7 @@ int sys_call_info(system_call_arguments_t* args, DiskRequest* req)
             args->arguments[2] = (intptr_t)req->trackCount;
             args->arguments[4] = (intptr_t)req->platterCount;
 
-            return;
+            return 0;
         }
     }
 
@@ -435,6 +443,7 @@ int sys_call_info(system_call_arguments_t* args, DiskRequest* req)
 
 int sys_call_read(system_call_arguments_t* args, DiskRequest* req)
 {
+
     req->deviceName = (char*)args->arguments[0];
 
     req->type = READ;
@@ -448,6 +457,28 @@ int sys_call_read(system_call_arguments_t* args, DiskRequest* req)
     {
         if (strcmp(req->deviceName, diskInfo[i].deviceName) == 0)
         {
+            // Input validation
+            if (req->platter < 0 || req->platter >= diskInfo[i].platters)
+            {
+                console_output(false, "SYS_DISKREAD(): Invalid platter.\n");
+                return -1;
+            }
+            if (req->track < 0 || req->track >= diskInfo[i].tracks)
+            {
+                console_output(false, "SYS_DISKREAD(): Invalid track.\n");
+                return -1;
+            }
+            if (req->firstSector < 0 || req->firstSector >= THREADS_DISK_SECTOR_COUNT)
+            {
+                console_output(false, "SYS_DISKREAD(): Invalid first sector.\n");
+                return -1;
+            }
+            if (req->sectors < 1 || req->sectors > THREADS_DISK_SECTOR_COUNT)
+            {
+                console_output(false, "SYS_DISKREAD(): Invalid number of sectors.\n");
+                return -1;
+            }
+
             pushDiskReq(i, diskRequestHead[i], req);
             k_semv(devicesProcs[(i + 6) % MAXPROC].semID); // i + 6 because disk pids start at 6
             k_semp(devicesProcs[req->pid % MAXPROC].semID); // Sleep until disk is finished
@@ -456,7 +487,7 @@ int sys_call_read(system_call_arguments_t* args, DiskRequest* req)
             args->arguments[0] = (intptr_t)req->status;
             args->arguments[1] = (intptr_t)req->dataBuffer;
 
-            return;
+            return 0;
         }
     }
 
@@ -480,6 +511,28 @@ int sys_call_write(system_call_arguments_t* args, DiskRequest* req)
     {
         if (strcmp(req->deviceName, diskInfo[i].deviceName) == 0)
         {
+            // Input validation
+            if (req->platter < 0 || req->platter >= diskInfo[i].platters)
+            {
+                console_output(false, "SYS_DISKWRITE(): Invalid platter.\n");
+                return -1;
+            }
+            if (req->track < 0 || req->track >= diskInfo[i].tracks)
+            {
+                console_output(false, "SYS_DISKWRITE(): Invalid track.\n");
+                return -1;
+            }
+            if (req->firstSector < 0 || req->firstSector >= THREADS_DISK_SECTOR_COUNT)
+            {
+                console_output(false, "SYS_DISKWRITE(): Invalid first sector.\n");
+                return -1;
+            }
+            if (req->sectors < 1 || req->sectors > THREADS_DISK_SECTOR_COUNT)
+            {
+                console_output(false, "SYS_DISKWRITE(): Invalid number of sectors.\n");
+                return -1;
+            }
+
             pushDiskReq(i, diskRequestHead[i], req);
             k_semv(devicesProcs[(i + 6) % MAXPROC].semID); // i + 6 because disk pids start at 6
             k_semp(devicesProcs[req->pid % MAXPROC].semID); // Sleep until disk is finished
@@ -487,7 +540,7 @@ int sys_call_write(system_call_arguments_t* args, DiskRequest* req)
             args->arguments[3] = (intptr_t)req->result;
             args->arguments[0] = (intptr_t)req->status;
 
-            return;
+            return 0;
         }
     }
 
@@ -498,6 +551,8 @@ int sys_call_write(system_call_arguments_t* args, DiskRequest* req)
 
 static void sysCall4(system_call_arguments_t* args)
 {
+    int status = 0;
+
     // Initialize Disk request
     DiskRequest req;
     req.nextReq = NULL;
@@ -521,29 +576,28 @@ static void sysCall4(system_call_arguments_t* args)
     req.pid = pid;
 
     devicesProcs[pid % MAXPROC].pid = pid;
-    devicesProcs[pid % MAXPROC].semID = k_semcreate(0);
 
     switch (args->call_id)
     {
         case SYS_SLEEP:
-            if (args->arguments[0] < 0)
-            {
-                console_output(false, "SYS_SLEEP(): Invalid number of seconds. Must be at least 0.\n");
-                return -1;
-            }
-
             args->arguments[3] = (intptr_t)sys_sleep(&args->arguments[0]);
             break;
 
         case SYS_DISKREAD:
-            return sys_call_read(args, &req);
+            sys_call_read(args, &req);
+            break;
 
         case SYS_DISKWRITE:
-            return sys_call_write(args, &req);
+            sys_call_write(args, &req);
+            break;
 
         case SYS_DISKINFO:
-            return sys_call_info(args, &req);
+            sys_call_info(args, &req);
+            break;
     }
+
+    clearProcess(&devicesProcs[pid % MAXPROC]);
+    return;
 }
 
 
@@ -690,6 +744,15 @@ static DiskRequest* popDiskReqHelperFCFS(int index, DiskRequest* head)
     }
 
     return target;
+}
+
+
+static void clearProcess(DevicesProcess* target)
+{
+    target->pid = -1;
+    target->wakeupTime = -1;
+    target->pNextSleeper = NULL;
+    target->pPrevSleeper = NULL;
 }
 
 
