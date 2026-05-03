@@ -439,6 +439,7 @@ int sys_call_info(system_call_arguments_t* args, DiskRequest* req)
         }
     }
 
+    args->arguments[3] = (intptr_t)(-1);
     console_output(false, "SYS_DISKINFO(): Invalid device name.\n");
     return -1;
 }
@@ -494,6 +495,7 @@ int sys_call_read(system_call_arguments_t* args, DiskRequest* req)
         }
     }
 
+    args->arguments[3] = (intptr_t)(-1);
     console_output(false, "SYS_DISKREAD(): Invalid device name.\n");
     return -1;
 }
@@ -547,6 +549,7 @@ int sys_call_write(system_call_arguments_t* args, DiskRequest* req)
         }
     }
 
+    args->arguments[3] = (intptr_t)(-1);
     console_output(false, "SYS_DISKWRITE(): Invalid device name.\n");
     return -1;
 }
