@@ -402,7 +402,7 @@ int sys_sleep(int* seconds)
 {
     int pid = k_getpid();
 
-    if (*seconds < 0)
+    if (*seconds <= 0)
     {
         console_output(FALSE, "%s - Invalid number of seconds.\n", "sys_sleep");
         return -1;
