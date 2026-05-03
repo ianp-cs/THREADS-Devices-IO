@@ -162,16 +162,19 @@ int SystemCallsEntryPoint(char* arg)
 
     // End running processes
     returnPid = k_wait(&status); // DevicesEntryPoint,  pid 8
+
+    for (int i = 0; i < MAXPROC; ++i)
+    {
+        k_semfree(devicesProcs[i].semID);
+    }
+
     returnPid = k_wait(&status); // Disk driver 0,      pid 6
     returnPid = k_wait(&status); // Disk driver 1,      pid 7
 
     k_kill(clockPID, SIG_TERM);
     returnPid = k_wait(&status); // Clock driver,       pid 5
 
-    for (int i = 0; i < MAXPROC; ++i)
-    {
-        k_semfree(devicesProcs[i].semID);
-    }
+    
 
     return 0;
 }
@@ -219,13 +222,14 @@ static int DiskDriver(char* arg)
     int currentTrack = moveDiskArm(diskInfo[diskNum].deviceName, 0);
     int currentSector = 0;
 
+    k_semv(diskInitChecker);
     /* Operating loop */
     
     while (!signaled())
     {
         k_semp(devicesProcs[pid % MAXPROC].semID); // Block until summoned
 
-        if (DISK_ARM_ALG == DISK_ARM_ALG_FCFS)
+        if (DISK_ARM_ALG == DISK_ARM_ALG_FCFS && diskRequestHead[diskNum] != NULL)
         {
             DiskRequest* req = popDiskReq(diskNum, diskRequestHead[diskNum]);
 
@@ -272,7 +276,6 @@ static void initDiskInfo(int diskNum)
     wait_device(diskInfo[diskNum].deviceName, &status);
     diskInfo[diskNum].tracks = status & 0xffff;
     diskInfo[diskNum].platters = status >> 16;
-    k_semv(diskInitChecker);
 }
 
 
