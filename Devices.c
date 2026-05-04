@@ -16,7 +16,7 @@
  * See Devices.h for available constants (DISK_ARM_ALG_FCFS, DISK_ARM_ALG_SSTF, etc.).
  * You must implement FCFS and SSTF. Change this value to test each algorithm.
  * Submissions will be assessed with DISK_ARM_ALG_FCFS and DISK_ARM_ALG_SSTF. */
-#define DISK_ARM_ALG   DISK_ARM_ALG_FCFS
+#define DISK_ARM_ALG   DISK_ARM_ALG_SSTF
 
 /* STRUCTURES */
 typedef struct devices_proc
@@ -68,18 +68,19 @@ int sys_disk_info(DiskRequest* req);
 int sys_disk_read(DiskRequest* req, int diskNum, int* currentTrack, int* currentSector);
 int sys_disk_write(DiskRequest* req, int diskNum, int* currentTrack, int* currentSector);
 int sys_sleep(int* seconds);
-int sys_call_info(system_call_arguments_t* args, DiskRequest* req);
-int sys_call_read(system_call_arguments_t* args, DiskRequest* req);
-int sys_call_write(system_call_arguments_t* args, DiskRequest* req);
+int create_info_request(system_call_arguments_t* args, DiskRequest* req);
+int create_read_request(system_call_arguments_t* args, DiskRequest* req);
+int create_write_request(system_call_arguments_t* args, DiskRequest* req);
 static void sysCall4(system_call_arguments_t* args);
 static void pushSleepQueue(DevicesProcess* target);
 static DevicesProcess* popSleepQueue();
-static void pushDiskReq(int index, DiskRequest* head, DiskRequest* target);
-static void pushDiskReqHelperFCFS(int index, DiskRequest* head, DiskRequest* target);
-static DiskRequest* popDiskReq(int index, DiskRequest* head);
-static DiskRequest* popDiskReqHelperFCFS(int index, DiskRequest* head);
+static void pushDiskReq(int index, DiskRequest* target);
+static DiskRequest* popDiskReq(int index, int* currentTrack, int* currentSector);
+static DiskRequest* popDiskReqHelperFCFS(int index);
+static DiskRequest* popDiskReqHelperSSTF(int index, int* currentTrack, int* currentSector);
+static DiskRequest* getClosestReq(int index, int* currentTrack, int* currentSector);
 static void initDiskInfo(int diskNum);
-static int moveDiskArm(char* deviceName, int target);
+static int diskSeek(char* deviceName, int target);
 static void clearProcess(DevicesProcess* target);
 static inline void checkKernelMode(const char* functionName);
 
@@ -219,7 +220,7 @@ static int DiskDriver(char* arg)
     initDiskInfo(diskNum);
 
     /* Initialize disk arm position */
-    int currentTrack = moveDiskArm(diskInfo[diskNum].deviceName, 0);
+    int currentTrack = diskSeek(diskInfo[diskNum].deviceName, 0);
     int currentSector = 0;
 
     k_semv(diskInitChecker);
@@ -229,9 +230,9 @@ static int DiskDriver(char* arg)
     {
         k_semp(devicesProcs[pid % MAXPROC].semID); // Block until summoned
 
-        if (DISK_ARM_ALG == DISK_ARM_ALG_FCFS && diskRequestHead[diskNum] != NULL)
+        if (diskRequestHead[diskNum] != NULL)
         {
-            DiskRequest* req = popDiskReq(diskNum, diskRequestHead[diskNum]);
+            DiskRequest* req = popDiskReq(diskNum, &currentTrack, &currentSector);
 
             switch (req->type)
             {
@@ -279,7 +280,7 @@ static void initDiskInfo(int diskNum)
 }
 
 
-static int moveDiskArm(char* deviceName, int target)
+static int diskSeek(char* deviceName, int target)
 {
     device_control_block_t devRequest;
     int result = -1;
@@ -293,7 +294,7 @@ static int moveDiskArm(char* deviceName, int target)
 
     if (result != 0)
     {
-        console_output(false, "moveDiskArm(): Device control failed! Couldn't move arm...\n");
+        console_output(false, "diskSeek(): Device control failed! Couldn't move arm...\n");
         stop(1);
     }
 
@@ -326,7 +327,7 @@ int sys_disk_read(DiskRequest* req, int diskNum, int* currentTrack, int* current
 
     if (*currentTrack != req->track)
     {
-        *currentTrack = moveDiskArm(req->deviceName, req->track);
+        *currentTrack = diskSeek(req->deviceName, req->track);
     }
 
     for (int i = 0; i < req->sectors; i++)
@@ -350,7 +351,7 @@ int sys_disk_read(DiskRequest* req, int diskNum, int* currentTrack, int* current
         {
             *currentSector = 0;
             int nextTrack = (*currentTrack + 1) % diskInfo[diskNum].tracks;
-            *currentTrack = moveDiskArm(req->deviceName, nextTrack);
+            *currentTrack = diskSeek(req->deviceName, nextTrack);
         }
     }
 }
@@ -366,7 +367,7 @@ int sys_disk_write(DiskRequest* req, int diskNum, int* currentTrack, int* curren
     
     if (*currentTrack != req->track)
     {
-        *currentTrack = moveDiskArm(req->deviceName, req->track);
+        *currentTrack = diskSeek(req->deviceName, req->track);
     }
 
     for (int i = 0; i < req->sectors; i++)
@@ -390,7 +391,7 @@ int sys_disk_write(DiskRequest* req, int diskNum, int* currentTrack, int* curren
         {
             *currentSector = 0;
             int nextTrack = (*currentTrack + 1) % diskInfo[diskNum].tracks;
-            *currentTrack = moveDiskArm(req->deviceName, nextTrack);
+            *currentTrack = diskSeek(req->deviceName, nextTrack);
         }
     }
 
@@ -416,7 +417,7 @@ int sys_sleep(int* seconds)
 }
 
 
-int sys_call_info(system_call_arguments_t* args, DiskRequest* req)
+int create_info_request(system_call_arguments_t* args, DiskRequest* req)
 {
     req->deviceName = (char*)args->arguments[0];
     req->type = INFO;
@@ -425,7 +426,7 @@ int sys_call_info(system_call_arguments_t* args, DiskRequest* req)
     {
         if (strcmp(req->deviceName, diskInfo[i].deviceName) == 0)
         {
-            pushDiskReq(i, diskRequestHead[i], req);
+            pushDiskReq(i, req);
             k_semv(devicesProcs[(i + 6) % MAXPROC].semID); // i + 6 because disk pids start at 6
             k_semp(devicesProcs[req->pid % MAXPROC].semID); // Sleep until disk is finished
 
@@ -445,7 +446,7 @@ int sys_call_info(system_call_arguments_t* args, DiskRequest* req)
 }
 
 
-int sys_call_read(system_call_arguments_t* args, DiskRequest* req)
+int create_read_request(system_call_arguments_t* args, DiskRequest* req)
 {
 
     req->deviceName = (char*)args->arguments[0];
@@ -483,7 +484,7 @@ int sys_call_read(system_call_arguments_t* args, DiskRequest* req)
                 return -1;
             }
 
-            pushDiskReq(i, diskRequestHead[i], req);
+            pushDiskReq(i, req);
             k_semv(devicesProcs[(i + 6) % MAXPROC].semID); // i + 6 because disk pids start at 6
             k_semp(devicesProcs[req->pid % MAXPROC].semID); // Sleep until disk is finished
 
@@ -501,7 +502,7 @@ int sys_call_read(system_call_arguments_t* args, DiskRequest* req)
 }
 
 
-int sys_call_write(system_call_arguments_t* args, DiskRequest* req)
+int create_write_request(system_call_arguments_t* args, DiskRequest* req)
 {
     req->deviceName = (char*)args->arguments[0];
 
@@ -538,7 +539,7 @@ int sys_call_write(system_call_arguments_t* args, DiskRequest* req)
                 return -1;
             }
 
-            pushDiskReq(i, diskRequestHead[i], req);
+            pushDiskReq(i, req);
             k_semv(devicesProcs[(i + 6) % MAXPROC].semID); // i + 6 because disk pids start at 6
             k_semp(devicesProcs[req->pid % MAXPROC].semID); // Sleep until disk is finished
 
@@ -590,15 +591,15 @@ static void sysCall4(system_call_arguments_t* args)
             break;
 
         case SYS_DISKREAD:
-            sys_call_read(args, &req);
+            create_read_request(args, &req);
             break;
 
         case SYS_DISKWRITE:
-            sys_call_write(args, &req);
+            create_write_request(args, &req);
             break;
 
         case SYS_DISKINFO:
-            sys_call_info(args, &req);
+            create_info_request(args, &req);
             break;
     }
 
@@ -684,21 +685,10 @@ static DevicesProcess* popSleepQueue()
 }
 
 
-static void pushDiskReq(int index, DiskRequest* head, DiskRequest* target)
+static void pushDiskReq(int index, DiskRequest* target)
 {
     k_semp(disk_mutex[index]);
 
-    if (DISK_ARM_ALG == DISK_ARM_ALG_FCFS)
-    {
-        pushDiskReqHelperFCFS(index, head, target);
-    }
-
-    k_semv(disk_mutex[index]);
-}
-
-
-static void pushDiskReqHelperFCFS(int index, DiskRequest* head, DiskRequest* target)
-{
     // Disk Request queue is empty
     if (diskRequestHead[index] == NULL)
     {
@@ -718,10 +708,12 @@ static void pushDiskReqHelperFCFS(int index, DiskRequest* head, DiskRequest* tar
         currReq->nextReq = target;
         target->prevReq = currReq;
     }
+
+    k_semv(disk_mutex[index]);
 }
 
 
-static DiskRequest* popDiskReq(int index, DiskRequest* head)
+static DiskRequest* popDiskReq(int index, int* currentTrack, int* currentSector)
 {
     k_semp(disk_mutex[index]);
 
@@ -729,7 +721,16 @@ static DiskRequest* popDiskReq(int index, DiskRequest* head)
 
     if (DISK_ARM_ALG == DISK_ARM_ALG_FCFS)
     {
-        target = popDiskReqHelperFCFS(index, head);
+        target = popDiskReqHelperFCFS(index);
+    }
+    else if (DISK_ARM_ALG == DISK_ARM_ALG_SSTF)
+    {
+        target = popDiskReqHelperSSTF(index, currentTrack, currentSector);
+    }
+
+    if (target == NULL)
+    {
+        console_output(false, "popDiskReq(): Attempted to pop from request queue, but the queue is empty!\n");
     }
 
     k_semv(disk_mutex[index]);
@@ -738,9 +739,9 @@ static DiskRequest* popDiskReq(int index, DiskRequest* head)
 }
 
 
-static DiskRequest* popDiskReqHelperFCFS(int index, DiskRequest* head)
+static DiskRequest* popDiskReqHelperFCFS(int index)
 {
-    DiskRequest* target;
+    DiskRequest* target = NULL;
 
     target = diskRequestHead[index];
     
@@ -750,6 +751,59 @@ static DiskRequest* popDiskReqHelperFCFS(int index, DiskRequest* head)
     }
 
     return target;
+}
+
+
+static DiskRequest* popDiskReqHelperSSTF(int index, int* currentTrack, int* currentSector)
+{
+    DiskRequest* target = getClosestReq(index, currentTrack, currentSector);
+
+    if (target == NULL) // Empty request queue
+    {
+        return NULL;
+    }
+
+    // Detach request from queue
+    if (target->prevReq != NULL)
+    {
+        target->prevReq->nextReq = target->nextReq;
+    }
+    if (target->nextReq != NULL)
+    {
+        target->nextReq->prevReq = target->prevReq;
+    }
+
+    // If target is the head of the list, move head to next in queue
+    if (target == diskRequestHead[index])
+    {
+        diskRequestHead[index] = target->nextReq;
+    }
+
+    return target;
+}
+
+
+static DiskRequest* getClosestReq(int index, int* currentTrack, int* currentSector)
+{
+    DiskRequest* closestReq = NULL;
+    DiskRequest* currReq = diskRequestHead[index];
+    int shortestDist = -1;
+    int currDist = 0;
+
+    while (currReq != NULL)
+    {
+        currDist = abs(currReq->track - *currentTrack);// + abs(currReq->firstSector - *currentSector);
+
+        if (currDist < shortestDist || shortestDist == -1)
+        {
+            shortestDist = currDist;
+            closestReq = currReq;
+        }
+        
+        currReq = currReq->nextReq;
+    }
+
+    return closestReq;
 }
 
 
