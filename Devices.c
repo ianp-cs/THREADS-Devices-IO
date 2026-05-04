@@ -1,3 +1,13 @@
+/* ------------------------------------------------------------------------
+   Devices.c
+   College of Applied Science and Technology
+   The University of Arizona
+   CYBV 489
+
+   Student Names:  Ian Penrose and Lindsay Wax
+
+   ------------------------------------------------------------------------ */
+
 #define _CRT_SECURE_NO_WARNINGS
 #include <stdio.h>
 #include <stdlib.h>
@@ -16,45 +26,49 @@
  * See Devices.h for available constants (DISK_ARM_ALG_FCFS, DISK_ARM_ALG_SSTF, etc.).
  * You must implement FCFS and SSTF. Change this value to test each algorithm.
  * Submissions will be assessed with DISK_ARM_ALG_FCFS and DISK_ARM_ALG_SSTF. */
-#define DISK_ARM_ALG   DISK_ARM_ALG_SSTF
+#define DISK_ARM_ALG   DISK_ARM_ALG_FCFS
 
 /* STRUCTURES */
 typedef struct devices_proc
 {
-    struct devices_proc* pNextSleeper;
-    struct devices_proc* pPrevSleeper;
-    int pid;
-    int semID;
-    int wakeupTime;
+    struct devices_proc* pNextSleeper;  // Pointer to next device in the sleep queue
+    struct devices_proc* pPrevSleeper;  // Pointer to previous device in the sleep queue
+    int pid;                            // Process pid
+    int semID;                          // Semaphor used to sleep and wake the process
+    int wakeupTime;                     // Requested sleep duration
 } DevicesProcess;
 
 typedef struct
 {
-    int tracks;
-    int platters;
-    char deviceName[THREADS_MAX_DEVICE_NAME];
+    int tracks;                                 // Number of tracks on the disk
+    int platters;                               // Number of platters on the disk
+    char deviceName[THREADS_MAX_DEVICE_NAME];   // Name of the device, i.e. "disk0"
 } DiskInformation;
-
-enum reqType { WRITE, READ, INFO };
+    
+enum reqType { WRITE, READ, INFO }; // Types of DiskRequests
 
 typedef struct disk_request
 {
-    struct disk_request* nextReq;
-    struct disk_request* prevReq;
-    int pid;
-    enum reqType type; 
-    char* deviceName;
-    int sectorSize;
-    int sectorCount; 
-    int trackCount; 
-    int platterCount;
-    void* dataBuffer; 
-    int platter; 
-    int track; 
-    int firstSector; 
-    int sectors;
-    int result;
-    int status;
+    // Used by all requests
+    struct disk_request* nextReq;   // Next request in the disk request queue
+    struct disk_request* prevReq;   // Previous request in the disk request queue
+    int pid;                        // Pid of the process that created the request
+    enum reqType type;              // Type of request
+    char* deviceName;               // Name of the target disk
+    int result;                     // Result code return by the relevant operation's function
+    int status;                     // Status code returned by wait_device() calls
+    // INFO request fields
+    int sectorSize;                 // Size of the target disk's sectors
+    int sectorCount;                // Number of sectors on the disk
+    int trackCount;                 // Number of tracks on the disk
+    int platterCount;               // Number of platters on the disk
+    // READ/WRITE request fields
+    void* dataBuffer;               // Data to be transferred
+    int platter;                    // Target platter on the disk
+    int track;                      // Target starting track on the disk
+    int firstSector;                // Target starting sector on the disk
+    int sectors;                    // Total number of sectors to be operated on (minimum 1)
+ 
 } DiskRequest;
 
 /* MUTEXES */
@@ -87,13 +101,22 @@ static inline void checkKernelMode(const char* functionName);
 extern int DevicesEntryPoint(char*);
 
 /* GLOBAL VARIABLES */
-static DevicesProcess devicesProcs[MAXPROC];
-static DevicesProcess* sleepQueueHead;
-static DiskRequest* diskRequestHead[THREADS_MAX_DISKS];
-static DiskInformation diskInfo[THREADS_MAX_DISKS];
-static int diskInitChecker = -1;
+static DevicesProcess devicesProcs[MAXPROC];                // List of device processes
+static DevicesProcess* sleepQueueHead;                      // Queue of sleeping processes
+static DiskRequest* diskRequestHead[THREADS_MAX_DISKS];     // Queue of disk requests
+static DiskInformation diskInfo[THREADS_MAX_DISKS];         // List of structs containing details about each disk
+static int diskInitChecker = -1;                            // Holds the id of the semaphor used to ensure disk initializations are complete
 
-
+/*
+ *  Routine:  SystemCallsEntryPoint
+ *
+ *  Description: Called by the SystemCalls module and initiates the setup for device I/O operations.
+ *
+ *  Arguments: char* arg -- optional arguments
+ *
+ *  Return Value: 0 means success
+ *
+ */
 int SystemCallsEntryPoint(char* arg)
 {
     char    buf[25];
@@ -175,12 +198,20 @@ int SystemCallsEntryPoint(char* arg)
     k_kill(clockPID, SIG_TERM);
     returnPid = k_wait(&status); // Clock driver,       pid 5
 
-    
-
     return 0;
 }
 
-
+/*
+ *  Routine: ClockDriver
+ *
+ *  Description: Uses the THREADS system clock to check each sleeping process and wakes them if
+ *               their wait time has elapsed.
+ *
+ *  Arguments: char* pArg - optional arguments passed to the driver
+ *
+ *  Return Value: 0 means success
+ *
+ */
 static int ClockDriver(char* arg)
 {
     int result;
@@ -193,7 +224,7 @@ static int ClockDriver(char* arg)
         result = wait_device("clock", &status);
         if (result != 0)
         {
-            return 0;
+            return -1;
         }
 
         /* Compute the current time and wake up any processes whose time has come */
@@ -208,7 +239,17 @@ static int ClockDriver(char* arg)
     return 0;
 }
 
-
+/*
+ *  Routine: DiskDriver
+ *
+ *  Description: Initializes the disk specified by arg and then processes incoming disk READ, WRITE,
+ *               and INFO requests.
+ *
+ *  Arguments: char* pArg - the index of the disk
+ *
+ *  Return Value: 0 means success
+ *
+ */
 static int DiskDriver(char* arg)
 {
     int pid = k_getpid();
@@ -249,14 +290,23 @@ static int DiskDriver(char* arg)
                     break;
             }
 
-            k_semv(devicesProcs[req->pid % MAXPROC].semID); // Unblock user process that used disk
+            k_semv(devicesProcs[req->pid % MAXPROC].semID); // Unblock user process that sent disk request
         }
     }
     
     return 0;
 }
 
-
+/*
+ *  Routine: initDiskInfo
+ *
+ *  Description: Initializes the diskInfo structs when disk drivers are being initialized.
+ *
+ *  Arguments: int diskNum - the index of the disk being initialized
+ *
+ *  Return Value: None
+ *
+ */
 static void initDiskInfo(int diskNum)
 {
     device_control_block_t devRequest;
@@ -279,7 +329,18 @@ static void initDiskInfo(int diskNum)
     diskInfo[diskNum].platters = status >> 16;
 }
 
-
+/*
+ *  Routine: diskSeek
+ *
+ *  Description: Moves the arm of the disk specified by deviceName to the track specified by 
+ *               target.
+ *
+ *  Arguments: char* deviceName - name of the disk
+ *             int target - the track on the disk the arm needs to be moved to
+ *
+ *  Return Value: int target
+ *
+ */
 static int diskSeek(char* deviceName, int target)
 {
     device_control_block_t devRequest;
@@ -303,7 +364,17 @@ static int diskSeek(char* deviceName, int target)
     return target;
 }
 
-
+/*
+ *  Routine: sys_disk_info
+ *
+ *  Description: Processes an INFO disk request, pulling information about the disk and placing it
+ *               with the request's fields to be returned to the calling process.
+ *
+ *  Arguments: DiskRequest* req - the request to be processed
+ *
+ *  Return Value: 0 means success
+ *
+ */
 int sys_disk_info(DiskRequest* req)
 {
     int index = k_getpid() - 6; // - 6 because disk pids start at 6
@@ -316,7 +387,20 @@ int sys_disk_info(DiskRequest* req)
     return 0;
 }
 
-
+/*
+ *  Routine: sys_disk_read
+ *
+ *  Description: Processes a READ disk request, pulling data from the disk and placing it into
+ *               the request's fields.
+ *
+ *  Arguments: DiskRequest* req - the request to be processed
+ *             int diskNum - the index of the disk being operated on
+ *             int* currentTrack - the current track the disk arm is located at
+ *             int* currentSector - the current sector the disk arm is located at
+ *
+ *  Return Value: 0 means success
+ *
+ */
 int sys_disk_read(DiskRequest* req, int diskNum, int* currentTrack, int* currentSector)
 {
     device_control_block_t devRequest;
@@ -354,9 +438,24 @@ int sys_disk_read(DiskRequest* req, int diskNum, int* currentTrack, int* current
             *currentTrack = diskSeek(req->deviceName, nextTrack);
         }
     }
+
+    return 0;
 }
 
-
+/*
+ *  Routine: sys_disk_write
+ *
+ *  Description: Processes a WRITE disk request, pulling data from the request's fields and placing
+ *               it on the disk.
+ *
+ *  Arguments: DiskRequest* req - the request to be processed
+ *             int diskNum - the index of the disk being operated on
+ *             int* currentTrack - the current track the disk arm is located at
+ *             int* currentSector - the current sector the disk arm is located at
+ *
+ *  Return Value: 0 means success
+ *
+ */
 int sys_disk_write(DiskRequest* req, int diskNum, int* currentTrack, int* currentSector)
 {
     device_control_block_t devRequest;
@@ -398,7 +497,16 @@ int sys_disk_write(DiskRequest* req, int diskNum, int* currentTrack, int* curren
     return 0;
 }
 
-
+/*
+ *  Routine: sys_sleep
+ *
+ *  Description: Places the current process into the sleep queue and then puts the process to sleep.
+ *
+ *  Arguments: int* seconds - the duration that the process will sleep
+ *
+ *  Return Value: 0 means success, -1 means invalid parameter
+ *
+ */
 int sys_sleep(int* seconds)
 {
     int pid = k_getpid();
@@ -416,7 +524,19 @@ int sys_sleep(int* seconds)
     return 0;
 }
 
-
+/*
+ *  Routine: create_info_request
+ *
+ *  Description: Creates an INFO disk request, placing the return values in the request into the
+ *               input args struct.
+ *
+ *  Arguments: system_call_arguments_t* args - the args needed for the request, then holds returned data
+ *             DiskRequest* req - an initialized struct that facilitates data transfer between the disk 
+                                  and calling process
+ *
+ *  Return Value: 0 means success, -1 means invalid parameter
+ *
+ */
 int create_info_request(system_call_arguments_t* args, DiskRequest* req)
 {
     req->deviceName = (char*)args->arguments[0];
@@ -445,7 +565,19 @@ int create_info_request(system_call_arguments_t* args, DiskRequest* req)
     return -1;
 }
 
-
+/*
+ *  Routine: create_read_request
+ *
+ *  Description: Creates a READ disk request, after performing input validation on args, then moves
+ *               data between the args and req structs.
+ *
+ *  Arguments: system_call_arguments_t* args - the args needed for the request, then holds returned data
+ *             DiskRequest* req - an initialized struct that facilitates data transfer between the disk
+                                  and calling process
+ *
+ *  Return Value: 0 means success, -1 means invalid parameter
+ *
+ */
 int create_read_request(system_call_arguments_t* args, DiskRequest* req)
 {
 
@@ -501,7 +633,19 @@ int create_read_request(system_call_arguments_t* args, DiskRequest* req)
     return -1;
 }
 
-
+/*
+ *  Routine: create_write_request
+ *
+ *  Description: Creates a WRITE disk request, after performing input validation on args, then moves
+ *               data between the args and req structs.
+ *
+ *  Arguments: system_call_arguments_t* args - the args needed for the request, then holds returned data
+ *             DiskRequest* req - an initialized struct that facilitates data transfer between the disk
+                                  and calling process
+ *
+ *  Return Value: 0 means success, -1 means invalid parameter
+ *
+ */
 int create_write_request(system_call_arguments_t* args, DiskRequest* req)
 {
     req->deviceName = (char*)args->arguments[0];
@@ -555,7 +699,18 @@ int create_write_request(system_call_arguments_t* args, DiskRequest* req)
     return -1;
 }
 
-
+/*
+ *  Routine: sysCall4
+ *
+ *  Description: Handles device-based system calls from user processes, including SLEEP, INFO, READ,
+ *               and WRITE requests. A diskRequest object is created and sent to relevant request
+ *               functions, except in the case of a SLEEP request, where it is then unused.
+ *
+ *  Arguments: system_call_arguments_t* args - the args needed for the request, then holds returned data
+ *
+ *  Return Value: None
+ *
+ */
 static void sysCall4(system_call_arguments_t* args)
 {
     int status = 0;
@@ -607,7 +762,16 @@ static void sysCall4(system_call_arguments_t* args)
     return;
 }
 
-
+/*
+ *  Routine: pushSleepQueue
+ *
+ *  Description: Places the target DevicesProcess onto the end of the sleep queue.
+ *
+ *  Arguments: DevicesProcess* target - the target process to be added
+ *
+ *  Return Value: None
+ *
+ */
 static void pushSleepQueue(DevicesProcess* target)
 {
     // Set mutex
@@ -663,7 +827,16 @@ static void pushSleepQueue(DevicesProcess* target)
     k_semv(sleep_mutex);
 }
 
-
+/*
+ *  Routine: popSleepQueue
+ *
+ *  Description: Removes the head of the queue and returns it.
+ *
+ *  Arguments: None
+ *
+ *  Return Value: DevicesProcess* target - the head of the queue or NULL if the queue is empty
+ *
+ */
 static DevicesProcess* popSleepQueue()
 {
     // Set mutex
@@ -684,7 +857,17 @@ static DevicesProcess* popSleepQueue()
     return target;
 }
 
-
+/*
+ *  Routine: pushDiskReq
+ *
+ *  Description: Places the target DiskRequest* onto the end of the disk requests queue.
+ *
+ *  Arguments: int index - determines which disk is used during the push operation
+ *             DiskRequest* target - the target request to be added
+ *
+ *  Return Value: None
+ *
+ */
 static void pushDiskReq(int index, DiskRequest* target)
 {
     k_semp(disk_mutex[index]);
@@ -712,7 +895,21 @@ static void pushDiskReq(int index, DiskRequest* target)
     k_semv(disk_mutex[index]);
 }
 
-
+/*
+ *  Routine: popDiskReq
+ *
+ *  Description: If the current disk arm algorithm is set to FCFS, returns the head of the disk
+ *               request queue indicated by index. If algorithm is set to SSTP, the request that
+ *               operates closest to the current location of the disk arm is returned.
+ *
+ *  Arguments: int index - determines which disk is used during the pop operation
+ *             int* currentTrack - the current track the disk arm is located at
+ *             int* currentSector - the current sector the disk arm is located at
+ *
+ *  Return Value: DiskRequest* target - the head of the disk request queue if using FCFS, the 
+ *                                      nearest request if SSTP, or NULL if the queue is empty
+ *
+ */
 static DiskRequest* popDiskReq(int index, int* currentTrack, int* currentSector)
 {
     k_semp(disk_mutex[index]);
@@ -738,7 +935,19 @@ static DiskRequest* popDiskReq(int index, int* currentTrack, int* currentSector)
     return target;
 }
 
-
+/*
+ *  Routine: popDiskReqHelperFCFS
+ *
+ *  Description: This helper function is used when the disk arm algorithm is set to FCFS. Performs
+ *               the actual pop operation and returns the head of the queue or NULL if the queue is
+ *               empty.
+ *
+ *  Arguments: int index - determines which disk is used during the pop operation
+ *
+ *  Return Value: DiskRequest* target - the head of the disk request queue if using FCFS or NULL if 
+                                        the queue is empty
+ *
+ */
 static DiskRequest* popDiskReqHelperFCFS(int index)
 {
     DiskRequest* target = NULL;
@@ -753,7 +962,20 @@ static DiskRequest* popDiskReqHelperFCFS(int index)
     return target;
 }
 
-
+/*
+ *  Routine: popDiskReqHelperSSTF
+ *
+ *  Description: This helper function is used when the disk arm algorithm is set to SSTP. Performs
+ *               the actual pop operation and returns the request whose operation is closest to the 
+                 current position of the arm. or NULL if the queue is empty.
+ *
+ *  Arguments: int index - determines which disk is used during the pop operation
+ *             int* currentTrack - the current track the disk arm is located at
+ *             int* currentSector - the current sector the disk arm is located at
+ *
+ *  Return Value: DiskRequest* target - the nearest request or NULL if the queue is empty
+ *
+ */
 static DiskRequest* popDiskReqHelperSSTF(int index, int* currentTrack, int* currentSector)
 {
     DiskRequest* target = getClosestReq(index, currentTrack, currentSector);
@@ -782,7 +1004,20 @@ static DiskRequest* popDiskReqHelperSSTF(int index, int* currentTrack, int* curr
     return target;
 }
 
-
+/*
+ *  Routine: getClosestReq
+ *
+ *  Description: This helper function is used when the disk arm algorithm is set to SSTP. Every
+ *               request in the queue has its distance from the disk arm calculated. The nearest
+ *               request is then returned.
+ *
+ *  Arguments: int index - determines which disk is used during the pop operation
+ *             int* currentTrack - the current track the disk arm is located at
+ *             int* currentSector - the current sector the disk arm is located at
+ *
+ *  Return Value: DiskRequest* closestReq - the request closest to the disk arm
+ *
+ */
 static DiskRequest* getClosestReq(int index, int* currentTrack, int* currentSector)
 {
     DiskRequest* closestReq = NULL;
@@ -806,7 +1041,16 @@ static DiskRequest* getClosestReq(int index, int* currentTrack, int* currentSect
     return closestReq;
 }
 
-
+/*
+ *  Routine: clearProcess
+ *
+ *  Description: Cleans the process struct's fields, preparing it for future use by a new process.
+ *
+ *  Arguments: DevicesProcess* target - the target to be cleared out
+ *
+ *  Return Value: None
+ *
+ */
 static void clearProcess(DevicesProcess* target)
 {
     target->pid = -1;
